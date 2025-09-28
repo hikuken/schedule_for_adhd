@@ -124,28 +124,156 @@ ADHD特性（着手困難・記憶負荷）を軽減するため、**カレン�
 
 ---
 
-## 6. データ要件（MVP想定スキーマ）
+## 6. データ要件（Supabaseスキーマ v0.3）
 
-### 6.1 Task
-| フィールド | 型 | 必須 | 説明 |
-|---|---|---:|---|
-| id | string | ✓ | 一意ID |
-| title | string | ✓ | タスクの内容 |
-| startAt | datetime/null |  | 開始日時 |
-| endAt | datetime/null |  | **終了日時（通知の初回基準）** |
-| repeat.type | enum(null/daily/weekly/monthly/yearly) |  | 繰り返し種別 |
-| repeat.meta | object/null |  | 補助情報（例: originalDay=31） |
-| subtasks | array<string> |  | サブタスク名 |
-| note | string |  | メモ |
-| status | enum(todo/done) | ✓ | 進行状態 |
-| doneAt | datetime/null |  | 完了日時（完了列並び/通知抑止に使用） |
-| createdAt / updatedAt | datetime | ✓ | 監査用 |
+### 6.1 テーブル一覧（MVP）
+| 論理名 | 物理名 | 用途 | 備考 |
+|---|---|---|---|
+| プロファイル | profiles | Supabase Authと連動した利用者メタ情報 | 匿名利用時は行がなくても可 |
+| デバイス | devices | 端末識別子とFCMトークン管理 | RLSの所有判定キー。匿名運用時の主体 |
+| タスクシリーズ | task_series | 繰り返し設定と共通メタデータ | repeat_type='none'で単発タスクを表現 |
+| タスクインスタンス | task_instances | 日毎のタスク実体（UIと通知はこれを参照） | series と 1:n |
+| サブタスク | task_subtasks | タスクインスタンス配下のサブタスク | 並び順 position、完了管理 is_completed |
+| 終了フォロー通知ジョブ | followup_jobs | 未完了タスク向けの再通知スケジューラ | task_instances と 1:1 |
+| 通知履歴 | notification_logs | Push送信の履歴・ステータス記録 | デバッグ／分析用途 |
+| 祝日マスタ | holidays | 日本の祝日データ | 読み取り専用。必要に応じて更新バッチ |
 
-### 6.2 Holiday（読み取り専用）
-| フィールド | 型 | 説明 |
+### 6.2 テーブル定義詳細
+
+#### profiles
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| id | uuid | ✓ | auth.uid() | Supabase AuthのユーザーID。匿名利用時はレコード未作成でも可 |
+| display_name | text |  |  | 任意の表示名 |
+| created_at | timestamptz | ✓ | now() | 作成日時 |
+| updated_at | timestamptz | ✓ | now() | 更新日時。`updated_at`はトリガーで自動更新 |
+
+#### devices
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| id | uuid | ✓ | gen_random_uuid() | 端末レコードID |
+| device_key | text | ✓ |  | 端末内で生成・保持する一意キー。`UNIQUE` |
+| profile_id | uuid |  |  | `profiles.id`。ログイン時に紐付け（null許容） |
+| platform | text | ✓ |  | `'ios' / 'android' / 'web'` 等 |
+| timezone | text | ✓ | 'Asia/Tokyo' | 通知・表示用タイムゾーン |
+| locale | text |  | 'ja-JP' | 端末ロケール（UI調整用） |
+| fcm_token | text |  |  | 最新FCMトークン。無効化時はnull |
+| app_version | text |  |  | SemVer形式想定 |
+| last_seen_at | timestamptz |  |  | 最終アクセス日時 |
+| created_at | timestamptz | ✓ | now() | 作成日時 |
+| updated_at | timestamptz | ✓ | now() | 更新日時 |
+
+#### task_series
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| id | uuid | ✓ | gen_random_uuid() | タスクシリーズID |
+| profile_id | uuid |  |  | `profiles.id`。匿名利用時はnull |
+| device_id | uuid | ✓ |  | `devices.id`（RLS用所有者） |
+| title | text | ✓ |  | デフォルトのタスク名（モーダル初期値） |
+| base_note | text |  |  | デフォルトのメモ |
+| timezone | text | ✓ | 'Asia/Tokyo' | 発生基準のタイムゾーン |
+| first_event_date | date | ✓ |  | 初回発生日（繰り返しの基準日） |
+| default_start_time | time |  |  | 既定の開始時刻（null=未設定） |
+| default_end_time | time |  |  | 既定の終了時刻（null=未設定） |
+| repeat_type | task_repeat_type | ✓ | 'none' | 繰り返し種別 |
+| repeat_interval | smallint | ✓ | 1 | 繰り返し間隔。例: 2なら隔日 |
+| repeat_weekday | smallint |  |  | `0(日)〜6(土)`。weekly時に使用 |
+| repeat_day_of_month | smallint |  |  | monthly時に使用。31日は末日に繰り上げ |
+| repeat_month | smallint |  |  | yearly時の月(1-12) |
+| repeat_end_date | date |  |  | 繰り返し終了日。null=無期限 |
+| is_active | boolean | ✓ | true | falseで今後のインスタンス生成を停止 |
+| created_at | timestamptz | ✓ | now() | 作成日時 |
+| updated_at | timestamptz | ✓ | now() | 更新日時 |
+| deleted_at | timestamptz |  |  | 論理削除（履歴保持用。null=有効） |
+
+#### task_instances
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| id | uuid | ✓ | gen_random_uuid() | タスクインスタンスID |
+| series_id | uuid | ✓ |  | `task_series.id`。`ON DELETE CASCADE` |
+| profile_id | uuid |  |  | `profiles.id`。シリーズと同じ値を持つ |
+| device_id | uuid | ✓ |  | `devices.id` |
+| occurrence_date | date | ✓ |  | UI・カレンダーで扱う日付 |
+| start_at | timestamptz |  |  | `occurrence_date`に`default_start_time`を適用した値（null可） |
+| end_at | timestamptz |  |  | 終了日時（通知の初回基準） |
+| status | task_status | ✓ | 'todo' | 進行状態 |
+| done_at | timestamptz |  |  | 完了日時（完了列表示 / 通知抑止） |
+| note | text |  |  | インスタンス固有のメモ |
+| carry_over_source_id | uuid |  |  | 前日からの繰り越し元インスタンスID（null許容） |
+| created_at | timestamptz | ✓ | now() | 作成日時 |
+| updated_at | timestamptz | ✓ | now() | 更新日時 |
+| deleted_at | timestamptz |  |  | 論理削除（UIから削除時） |
+
+> 制約例: `UNIQUE (series_id, occurrence_date)`（同一シリーズの同日重複生成を防止）、`CHECK (start_at IS NULL OR end_at IS NULL OR start_at <= end_at)`。
+
+#### task_subtasks
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| id | uuid | ✓ | gen_random_uuid() | サブタスクID |
+| task_instance_id | uuid | ✓ |  | `task_instances.id`（`ON DELETE CASCADE`） |
+| title | text | ✓ |  | サブタスク名 |
+| is_completed | boolean | ✓ | false | 完了状態。繰り返し生成時に初期化 |
+| position | smallint | ✓ | 0 | 表示順。フロント側で並び替え管理 |
+| created_at | timestamptz | ✓ | now() | 作成日時 |
+| updated_at | timestamptz | ✓ | now() | 更新日時 |
+
+#### followup_jobs
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| id | uuid | ✓ | gen_random_uuid() | ジョブID |
+| task_instance_id | uuid | ✓ |  | `task_instances.id`。`UNIQUE`制約 |
+| device_id | uuid | ✓ |  | 通知対象端末 |
+| next_fire_at | timestamptz | ✓ |  | 次回通知予定時刻 |
+| last_fired_at | timestamptz |  |  | 直近の通知実行時刻 |
+| retry_count | integer | ✓ | 0 | 再通知回数（初回0） |
+| status | followup_job_status | ✓ | 'scheduled' | ジョブ状態 |
+| payload | jsonb |  | '{}'::jsonb | 通知本文やテンプレート差分 |
+| created_at | timestamptz | ✓ | now() | 作成日時 |
+| updated_at | timestamptz | ✓ | now() | 更新日時 |
+
+#### notification_logs
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| id | uuid | ✓ | gen_random_uuid() | 通知ログID |
+| followup_job_id | uuid |  |  | `followup_jobs.id`（null=手動送信等） |
+| task_instance_id | uuid |  |  | 対象タスク（解析用） |
+| device_id | uuid | ✓ |  | 実際に送信した端末 |
+| status | notification_status | ✓ | 'queued' | 送信状態 |
+| sent_at | timestamptz |  |  | FCMへリクエストした時刻 |
+| delivered_at | timestamptz |  |  | 配信確認時刻（未取得ならnull） |
+| response_code | text |  |  | FCMレスポンスコード |
+| response_payload | jsonb |  | '{}'::jsonb | FCMレスポンス全文（デバッグ用） |
+| created_at | timestamptz | ✓ | now() | 監査用タイムスタンプ |
+
+#### holidays（読み取り専用）
+| フィールド | 型 | 必須 | デフォルト | 説明 |
+|---|---|---:|---|---|
+| holiday_date | date | ✓ |  | 祝日の日付（PK） |
+| name | text | ✓ |  | 祝日名（例: 成人の日） |
+| region | text | ✓ | 'JP' | 対象地域コード |
+| source | text |  |  | データソース（内閣府CSV等） |
+| updated_at | timestamptz | ✓ | now() | データ更新日時 |
+
+### 6.3 Enum定義
+| Enum名 | 値 | 説明 |
 |---|---|---|
-| date | date | 祝日 |
-| name | string | 祝日名 |
+| task_status | `todo`, `done` | 今日画面の列制御・通知抑止に使用 |
+| task_repeat_type | `none`, `daily`, `weekly`, `monthly`, `yearly` | 繰り返し種別 |
+| followup_job_status | `scheduled`, `paused`, `completed`, `cancelled`, `error` | 終了フォロー通知ジョブの状態管理 |
+| notification_status | `queued`, `sent`, `delivered`, `failed` | 通知履歴の配信状態 |
+
+### 6.4 ビジネスロジック補足
+- **タスク生成**: モーダル保存時に `task_series` と当該日の `task_instances` を同時作成。`repeat_type <> 'none'` の場合は Edge Function / cron で先14〜30日分の `task_instances` を先行生成し、サブタスクは最新インスタンスを複製する。
+- **完了処理**: 今日画面のチェック操作で `task_instances.status = 'done'`, `done_at = now()` に更新し、紐づく `followup_jobs` を `status='completed'` へ遷移。未完了の場合のみ `followup_jobs.next_fire_at` をローリング更新。
+- **削除**: 編集モーダルの削除は `task_instances.deleted_at` を設定（履歴保持）。シリーズ全体削除は `task_series.deleted_at` を設定し、新規インスタンス生成を停止後に既存行も段階的にパージ。
+- **通知スキャン**: pg_cron で `next_fire_at <= now()` の `followup_jobs` を取得し、送信成功時に `last_fired_at` 更新・`next_fire_at` を 0〜1時間の乱数で再計算。
+- **祝日同期**: `holidays` は管理者のみ書き込み可。定期的なCSV取り込み関数を用意。
+
+### 6.5 RLS / インデックス方針
+- **RLS**: `devices` は `auth.jwt()` に含める `device_key` で `device_key = current_setting('request.jwt.claim.device_key', true)` を検証。`task_series`, `task_instances`, `task_subtasks`, `followup_jobs`, `notification_logs` は `(profile_id = auth.uid()) OR (device_id = owner_device_id())` でアクセス制御。
+- **主なインデックス**: `task_instances(device_id, occurrence_date DESC)`、`task_instances(status, occurrence_date)`、`followup_jobs(next_fire_at)`、`notification_logs(device_id, sent_at DESC)`。
+- **トリガー**: `updated_at` 自動更新と `start_at <= end_at` バリデーション、タスク完了時の `followup_jobs` 自動停止をPL/pgSQLトリガーで実装。
+- **ビュー**: フロント向けに `v_today_tasks(device_id, occurrence_date)` を作成し、`task_instances` と `task_subtasks` を結合した読み取り専用ビューを提供予定。
 
 ---
 
