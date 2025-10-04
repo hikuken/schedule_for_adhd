@@ -117,7 +117,9 @@ app.*.symbols
 !**/ios/**/default.perspectivev3
 !/packages/flutter_tools/test/data/dart_dependencies_test/**/.packages
 !/dev/ci/**/Gemfile.lock
+
 # Supabase / Firebase secrets
 .env
 supabase/.env
 supabase/firebase-service-account.json
+supabase/fcm_secrets.env
